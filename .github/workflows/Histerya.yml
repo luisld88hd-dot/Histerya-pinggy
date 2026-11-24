@@ -1,90 +1,4 @@
 
-name: Hysteria 2 con Pinggy UDP
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  hysteria:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
-
-    steps:
-      - name: Instalar dependencias
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl openssl jq
-
-      - name: Instalar Hysteria 2
-        run: |
-          curl -L \
-            https://download.hysteria.network/app/latest/hysteria-linux-amd64 \
-            -o hysteria
-          chmod +x hysteria
-          sudo mv hysteria /usr/local/bin/hysteria
-          hysteria version
-
-      - name: Instalar Pinggy CLI
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Preparar Pinggy
-        run: |
-          npm install -g pinggy
-          pinggy --help
-
-      - name: Crear servidor Hysteria
-        env:
-          PASSWORD: ${{ secrets.HY2_PASSWORD }}
-        run: |
-          set -e
-
-          if [ -z "$PASSWORD" ]; then
-            PASSWORD="$(openssl rand -hex 16)"
-          fi
-
-          echo "HY2_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
-
-          sudo mkdir -p /etc/hysteria
-
-          sudo openssl req -x509 -nodes -newkey rsa:2048 \
-            -keyout /etc/hysteria/server.key \
-            -out /etc/hysteria/server.crt \
-            -days 2 \
-            -subj "/CN=hy2.local" \
-            -addext "subjectAltName=DNS:hy2.local"
-
-          sudo chmod 600 /etc/hysteria/server.key
-
-          sudo tee /etc/hysteria/config.yaml > /dev/null <<EOF
-          listen: :8443
-
-          tls:
-            cert: /etc/hysteria/server.crt
-            key: /etc/hysteria/server.key
-
-          auth:
-            type: password
-            password: ${PASSWORD}
-          EOF
-
-          sudo hysteria server -c /etc/hysteria/config.yaml \
-            > /tmp/hysteria.log 2>&1 &
-
-          sleep 3
-
-          if ! pgrep -f "hysteria server" > /dev/null; then
-            cat /tmp/hysteria.log
-            echo "ERROR: Hysteria no pudo iniciar"
-            exit 1
-          fi
-
-          echo "Hysteria está escuchando en UDP 8443"
-
       - name: Iniciar túnel UDP de Pinggy
         env:
           PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
@@ -92,39 +6,38 @@ jobs:
           set -e
 
           if [ -z "$PINGGY_TOKEN" ]; then
-            echo "ERROR: Falta el secreto PINGGY_TOKEN"
+            echo "ERROR: Falta PINGGY_TOKEN"
             exit 1
           fi
 
-          nohup pinggy \
+          nohup stdbuf -oL -eL pinggy \
             -p 443 \
             -R0:localhost:8443 \
-            -L4300:localhost:4300 \
             "${PINGGY_TOKEN}+udp@br.free.pinggy.io" \
             > /tmp/pinggy.log 2>&1 &
 
-          echo "Esperando la dirección UDP pública..."
+          echo "Esperando el túnel UDP..."
 
-          for i in $(seq 1 60); do
-            sleep 2
+          ENDPOINT=""
 
-            RESPONSE="$(curl -fsS http://127.0.0.1:4300/urls 2>/dev/null || true)"
+          for i in $(seq 1 90); do
+            ENDPOINT="$(grep -oE 'udp://[^[:space:]]+' /tmp/pinggy.log | head -n 1 | tr -d '\r' || true)"
 
-            if [ -n "$RESPONSE" ]; then
-              ENDPOINT="$(echo "$RESPONSE" | jq -r \
-                '.urls[]? | select(startswith("udp://"))' | head -n 1)"
-
-              if [ -n "$ENDPOINT" ]; then
-                break
-              fi
+            if [ -n "$ENDPOINT" ]; then
+              break
             fi
+
+            if ! pgrep -af 'pinggy' | grep -q 'br.free.pinggy.io'; then
+              echo "ERROR: Pinggy se detuvo."
+              cat /tmp/pinggy.log
+              exit 1
+            fi
+
+            sleep 2
           done
 
-          if [ -z "${ENDPOINT:-}" ]; then
-            echo "ERROR: No se pudo obtener el endpoint UDP."
-            echo "Respuesta de Pinggy:"
-            echo "${RESPONSE:-Sin respuesta}"
-            echo "Logs de Pinggy:"
+          if [ -z "$ENDPOINT" ]; then
+            echo "ERROR: No se encontró la dirección UDP."
             cat /tmp/pinggy.log
             exit 1
           fi
@@ -135,11 +48,10 @@ jobs:
           import os
           from urllib.parse import urlsplit
 
-          endpoint = os.environ["ENDPOINT"]
-          parsed = urlsplit(endpoint)
+          parsed = urlsplit(os.environ["ENDPOINT"])
 
           if parsed.scheme != "udp" or not parsed.hostname or not parsed.port:
-              raise SystemExit("Endpoint UDP inválido: " + endpoint)
+              raise SystemExit("Endpoint UDP inválido")
 
           host = parsed.hostname
           if ":" in host:
@@ -149,36 +61,4 @@ jobs:
           print("PUBLIC_PORT=" + str(parsed.port))
           PY
 
-      - name: Mostrar configuración para Agent VPN
-        run: |
-          echo ""
-          echo "======================================"
-          echo "       HYSTERIA 2 - AGENT VPN"
-          echo "======================================"
-          echo "Servidor: ${PUBLIC_HOST}"
-          echo "Puerto UDP: ${PUBLIC_PORT}"
-          echo "Contraseña: ${HY2_PASSWORD}"
-          echo ""
-          echo "URI PARA IMPORTAR:"
-          echo "hysteria2://${HY2_PASSWORD}@${PUBLIC_HOST}:${PUBLIC_PORT}/?insecure=1#AgentVPN"
-          echo ""
-          echo "======================================"
-
-      - name: Mantener servidor activo
-        run: |
-          echo "Servidor activo. El túnel gratuito puede expirar."
-          while true; do
-            if ! pgrep -f "hysteria server" > /dev/null; then
-              echo "ERROR: Hysteria se detuvo."
-              cat /tmp/hysteria.log
-              exit 1
-            fi
-
-            if ! pgrep -af "pinggy" | grep -q "br.free.pinggy.io"; then
-              echo "ADVERTENCIA: No se detecta el proceso de Pinggy."
-              cat /tmp/pinggy.log
-              exit 1
-            fi
-
-            sleep 30
-          done
+          echo "Túnel UDP detectado correctamente."
