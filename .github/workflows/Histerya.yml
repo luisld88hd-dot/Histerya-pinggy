@@ -1,0 +1,140 @@
+
+name: Hysteria 2 with Pinggy UDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hysteria:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Hysteria 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL https://get.hy2.sh/ \
+            -o "$RUNNER_TEMP/install-hy2.sh"
+
+          sudo bash "$RUNNER_TEMP/install-hy2.sh"
+
+          hysteria version
+
+      - name: Install Pinggy CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g pinggy
+          pinggy --version
+
+      - name: Configure Hysteria 2
+        shell: bash
+        env:
+          PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PINGGY_TOKEN" ]; then
+            echo "ERROR: Missing PINGGY_TOKEN secret."
+            exit 1
+          fi
+
+          PORT=8443
+          SNI="hysteria-pinggy"
+
+          # Generate TLS certificate
+          openssl req -x509 -newkey rsa:2048 -sha256 \
+            -days 2 -nodes \
+            -keyout "$RUNNER_TEMP/server.key" \
+            -out "$RUNNER_TEMP/server.crt" \
+            -subj "/CN=$SNI" \
+            -addext "subjectAltName=DNS:$SNI"
+
+          chmod 600 "$RUNNER_TEMP/server.key"
+
+          # Generate password
+          PASSWORD="$(openssl rand -hex 24)"
+
+          # Calculate certificate fingerprint
+          CERT_PIN="$(openssl x509 \
+            -in "$RUNNER_TEMP/server.crt" \
+            -noout -fingerprint -sha256 \
+            | sed 's/.*=//' \
+            | tr -d ':' \
+            | tr '[:upper:]' '[:lower:]')"
+
+          # Write Hysteria configuration
+          cat > "$RUNNER_TEMP/config.yaml" <<EOF
+          listen: ":$PORT"
+
+          tls:
+            cert: "$RUNNER_TEMP/server.crt"
+            key: "$RUNNER_TEMP/server.key"
+
+          auth:
+            type: password
+            password: "$PASSWORD"
+          EOF
+
+          chmod 600 "$RUNNER_TEMP/config.yaml"
+
+          # Start Hysteria in background
+          nohup hysteria server \
+            -c "$RUNNER_TEMP/config.yaml" \
+            > "$RUNNER_TEMP/hysteria.log" 2>&1 &
+
+          echo $! > "$RUNNER_TEMP/hysteria.pid"
+
+          sleep 3
+
+          if ! kill -0 "$(cat "$RUNNER_TEMP/hysteria.pid")" 2>/dev/null; then
+            echo "ERROR: Hysteria failed to start."
+            cat "$RUNNER_TEMP/hysteria.log"
+            exit 1
+          fi
+
+          echo ""
+          echo "===================================="
+          echo "       HYSTERIA 2 SERVER READY"
+          echo "===================================="
+          echo "Local UDP port: $PORT"
+          echo "Password: $PASSWORD"
+          echo "SNI: $SNI"
+          echo "Certificate SHA256: $CERT_PIN"
+          echo "===================================="
+
+          echo "$PASSWORD" > "$RUNNER_TEMP/password.txt"
+          echo "$CERT_PIN" > "$RUNNER_TEMP/certpin.txt"
+          echo "$SNI" > "$RUNNER_TEMP/sni.txt"
+
+      - name: Start Pinggy UDP Tunnel
+        shell: bash
+        env:
+          PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo ""
+          echo "===================================="
+          echo "       STARTING PINGGY UDP"
+          echo "===================================="
+          echo "Forwarding public UDP traffic to localhost:8443"
+          echo "Wait for Pinggy to display its public endpoint."
+          echo ""
+
+          # Keep the tunnel in foreground.
+          pinggy \
+            --type udp \
+            --localport 8443 \
+            --token "$PINGGY_TOKEN" \
+            --v
