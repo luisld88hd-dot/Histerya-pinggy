@@ -10,7 +10,7 @@ permissions:
 jobs:
   hysteria:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 65
 
     steps:
       - name: Install Node.js
@@ -31,26 +31,37 @@ jobs:
           hysteria version
 
       - name: Install Pinggy CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install -g pinggy
-          pinggy --version
+        run: npm install -g pinggy
 
-      - name: Configure Hysteria 2
+      - name: Start Hysteria and Pinggy UDP
         shell: bash
         env:
           PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
         run: |
           set -euo pipefail
 
-          if [ -z "$PINGGY_TOKEN" ]; then
-            echo "ERROR: Missing PINGGY_TOKEN secret."
+          if [ -z "${PINGGY_TOKEN:-}" ]; then
+            echo "ERROR: PINGGY_TOKEN secret is missing."
             exit 1
           fi
 
           PORT=8443
           SNI="hysteria-pinggy"
+          HY2_LOG="$RUNNER_TEMP/hysteria.log"
+          PINGGY_LOG="$RUNNER_TEMP/pinggy.log"
+          CONFIG="$RUNNER_TEMP/config.yaml"
+
+          HY2_PID=""
+          PINGGY_PID=""
+          TAIL_PID=""
+
+          cleanup() {
+            [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
+            [ -n "$PINGGY_PID" ] && kill "$PINGGY_PID" 2>/dev/null || true
+            [ -n "$HY2_PID" ] && kill "$HY2_PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT INT TERM
 
           # Generate TLS certificate
           openssl req -x509 -newkey rsa:2048 -sha256 \
@@ -73,8 +84,8 @@ jobs:
             | tr -d ':' \
             | tr '[:upper:]' '[:lower:]')"
 
-          # Write Hysteria configuration
-          cat > "$RUNNER_TEMP/config.yaml" <<EOF
+          # Configure Hysteria
+          cat > "$CONFIG" <<EOF
           listen: ":$PORT"
 
           tls:
@@ -86,55 +97,122 @@ jobs:
             password: "$PASSWORD"
           EOF
 
-          chmod 600 "$RUNNER_TEMP/config.yaml"
+          chmod 600 "$CONFIG"
 
-          # Start Hysteria in background
-          nohup hysteria server \
-            -c "$RUNNER_TEMP/config.yaml" \
-            > "$RUNNER_TEMP/hysteria.log" 2>&1 &
+          # Start Hysteria
+          echo "Starting Hysteria 2..."
 
-          echo $! > "$RUNNER_TEMP/hysteria.pid"
+          hysteria server -c "$CONFIG" > "$HY2_LOG" 2>&1 &
+          HY2_PID=$!
 
           sleep 3
 
-          if ! kill -0 "$(cat "$RUNNER_TEMP/hysteria.pid")" 2>/dev/null; then
+          if ! kill -0 "$HY2_PID" 2>/dev/null; then
             echo "ERROR: Hysteria failed to start."
-            cat "$RUNNER_TEMP/hysteria.log"
+            cat "$HY2_LOG"
             exit 1
           fi
 
-          echo ""
-          echo "===================================="
-          echo "       HYSTERIA 2 SERVER READY"
-          echo "===================================="
-          echo "Local UDP port: $PORT"
-          echo "Password: $PASSWORD"
-          echo "SNI: $SNI"
-          echo "Certificate SHA256: $CERT_PIN"
-          echo "===================================="
+          echo "Hysteria is listening on UDP $PORT."
 
-          echo "$PASSWORD" > "$RUNNER_TEMP/password.txt"
-          echo "$CERT_PIN" > "$RUNNER_TEMP/certpin.txt"
-          echo "$SNI" > "$RUNNER_TEMP/sni.txt"
+          # Start Pinggy UDP tunnel
+          echo "Starting Pinggy UDP tunnel..."
 
-      - name: Start Pinggy UDP Tunnel
-        shell: bash
-        env:
-          PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          echo ""
-          echo "===================================="
-          echo "       STARTING PINGGY UDP"
-          echo "===================================="
-          echo "Forwarding public UDP traffic to localhost:8443"
-          echo "Wait for Pinggy to display its public endpoint."
-          echo ""
-
-          # Keep the tunnel in foreground.
           pinggy \
             --type udp \
-            --localport 8443 \
+            --localport "$PORT" \
             --token "$PINGGY_TOKEN" \
-            --v
+            --v > "$PINGGY_LOG" 2>&1 &
+
+          PINGGY_PID=$!
+
+          # Wait for Pinggy to allocate its public endpoint
+          REMOTE_URL=""
+
+          for i in $(seq 1 120); do
+
+            if ! kill -0 "$HY2_PID" 2>/dev/null; then
+              echo "ERROR: Hysteria stopped unexpectedly."
+              cat "$HY2_LOG"
+              exit 1
+            fi
+
+            if ! kill -0 "$PINGGY_PID" 2>/dev/null; then
+              echo "ERROR: Pinggy stopped unexpectedly."
+              cat "$PINGGY_LOG"
+              exit 1
+            fi
+
+            REMOTE_URL="$(sed -E \
+              's/\x1B\[[0-9;]*[[:alpha:]]//g' \
+              "$PINGGY_LOG" \
+              | grep -Eo 'udp://[A-Za-z0-9.-]+:[0-9]+' \
+              | tail -n 1 || true)"
+
+            if [ -n "$REMOTE_URL" ]; then
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ -z "$REMOTE_URL" ]; then
+            echo "ERROR: Could not detect Pinggy public UDP endpoint."
+            cat "$PINGGY_LOG"
+            exit 1
+          fi
+
+          # Extract public hostname and port
+          ENDPOINT="${REMOTE_URL#udp://}"
+          PUBLIC_HOST="${ENDPOINT%:*}"
+          PUBLIC_PORT="${ENDPOINT##*:}"
+
+          if ! [[ "$PUBLIC_PORT" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid public UDP port."
+            exit 1
+          fi
+
+          # Construct Hysteria 2 import URI
+          URI="hysteria2://${PASSWORD}@${PUBLIC_HOST}:${PUBLIC_PORT}/?sni=${SNI}&insecure=1&pinSHA256=${CERT_PIN}#Hysteria-Pinggy"
+
+          # Print Pinggy connection information
+          cat "$PINGGY_LOG"
+
+          echo ""
+          echo "================================================"
+          echo "          HYSTERIA 2 SERVER READY"
+          echo "================================================"
+          echo ""
+          echo "SERVER ADDRESS: $PUBLIC_HOST"
+          echo "PUBLIC PORT: $PUBLIC_PORT"
+          echo "LOCAL PORT: $PORT"
+          echo "PROTOCOL: UDP / QUIC"
+          echo "USERNAME: Not required"
+          echo "PASSWORD: $PASSWORD"
+          echo "SNI: $SNI"
+          echo "TLS: Enabled"
+          echo "TLS INSECURE: Enabled with certificate pin"
+          echo "CERTIFICATE SHA256: $CERT_PIN"
+          echo ""
+          echo "COMPLETE ANDROID IMPORT URI:"
+          echo ""
+          echo "$URI"
+          echo ""
+          echo "================================================"
+          echo "Keep this GitHub Actions job running."
+          echo "================================================"
+
+          # Continue displaying Pinggy logs
+          tail -n 0 -F "$PINGGY_LOG" &
+          TAIL_PID=$!
+
+          # Keep both services alive
+          while kill -0 "$HY2_PID" 2>/dev/null &&
+                kill -0 "$PINGGY_PID" 2>/dev/null; do
+            sleep 5
+          done
+
+          echo "ERROR: One of the services stopped."
+          cat "$HY2_LOG"
+          cat "$PINGGY_LOG"
+          exit 1
