@@ -17,28 +17,25 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Instalar, iniciar Hysteria y crear túnel
+      - name: Iniciar Hysteria 2 y Pinggy UDP
         shell: bash
         env:
           PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
         run: |
           set -Eeuo pipefail
 
-          echo "===================================="
-          echo "INSTALANDO HYSTERIA 2"
-          echo "===================================="
-
-          if [[ -z "${PINGGY_TOKEN:-}" ]]; then
-            echo "ERROR: No existe el secreto PINGGY_TOKEN."
-            exit 1
-          fi
-
           DIR="${RUNNER_TEMP}/hysteria-pinggy"
           BIN="${RUNNER_TEMP}/bin"
 
           mkdir -p "$DIR" "$BIN"
 
-          # Descargar el ejecutable oficial de Hysteria 2.
+          echo "===== INSTALANDO HYSTERIA ====="
+
+          if [[ -z "${PINGGY_TOKEN:-}" ]]; then
+            echo "ERROR: falta el secreto PINGGY_TOKEN."
+            exit 1
+          fi
+
           curl -fL --retry 3 \
             "https://download.hysteria.network/app/latest/hysteria-linux-amd64" \
             -o "$BIN/hysteria"
@@ -46,39 +43,30 @@ jobs:
           chmod +x "$BIN/hysteria"
 
           HY2="$BIN/hysteria"
-
           "$HY2" --help >/dev/null
 
           echo "Hysteria instalado correctamente."
 
-          # Instalar Pinggy.
-          echo "===================================="
-          echo "INSTALANDO PINGGY"
-          echo "===================================="
+          echo "===== INSTALANDO PINGGY ====="
 
           npm install -g pinggy
 
           NPM_PREFIX="$(npm prefix -g)"
           export PATH="${NPM_PREFIX}/bin:${PATH}"
 
-          if ! command -v pinggy >/dev/null 2>&1; then
-            echo "ERROR: No se encontró el ejecutable de Pinggy."
-            echo "Ruta npm: $NPM_PREFIX"
+          PINGGY="$(command -v pinggy)"
+
+          if [[ -z "$PINGGY" ]]; then
+            echo "ERROR: no se encontró Pinggy."
             exit 1
           fi
 
-          PINGGY="$(command -v pinggy)"
+          echo "Pinggy instalado: $PINGGY"
 
-          echo "Pinggy instalado correctamente: $PINGGY"
+          echo "===== CREANDO CERTIFICADO ====="
 
-          # Crear contraseña.
           PASSWORD="$(openssl rand -hex 24)"
           PORT=8443
-
-          # Crear certificado.
-          echo "===================================="
-          echo "CREANDO CERTIFICADO"
-          echo "===================================="
 
           openssl req -x509 -newkey rsa:2048 \
             -sha256 \
@@ -89,7 +77,6 @@ jobs:
             -subj "/CN=hy2.local" \
             -addext "subjectAltName=DNS:hy2.local"
 
-          # Configuración del servidor.
           cat > "$DIR/config.yaml" <<EOF
           listen: 0.0.0.0:${PORT}
 
@@ -103,10 +90,7 @@ jobs:
             password: ${PASSWORD}
           EOF
 
-          # Iniciar Hysteria.
-          echo "===================================="
-          echo "INICIANDO SERVIDOR HYSTERIA"
-          echo "===================================="
+          echo "===== INICIANDO HYSTERIA ====="
 
           "$HY2" server -c "$DIR/config.yaml" \
             > "$DIR/hysteria.log" 2>&1 &
@@ -121,12 +105,9 @@ jobs:
             exit 1
           fi
 
-          echo "Servidor Hysteria iniciado."
+          echo "Hysteria iniciado correctamente."
 
-          # Iniciar Pinggy UDP.
-          echo "===================================="
-          echo "INICIANDO TUNEL PINGGY UDP"
-          echo "===================================="
+          echo "===== INICIANDO PINGGY UDP ====="
 
           "$PINGGY" \
             --type udp \
@@ -137,20 +118,40 @@ jobs:
 
           PINGGY_PID=$!
 
-          # Esperar la dirección pública.
+          echo "Esperando dirección pública..."
+
           ENDPOINT=""
 
           for attempt in $(seq 1 120); do
 
-            ENDPOINT="$(grep -Eo 'udp://[^[:space:]]+' \
-              "$DIR/pinggy.log" | head -n 1 || true)"
+            # Limpiar códigos ANSI y retornos de carro.
+            CLEAN_LOG="$(
+              sed -E 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' \
+                "$DIR/pinggy.log" | tr -d '\r'
+            )"
+
+            # Buscar primero la dirección UDP completa.
+            ENDPOINT="$(
+              printf '%s\n' "$CLEAN_LOG" |
+              grep -Eo 'udp://[^[:space:]]+' |
+              tail -n 1 || true
+            )"
+
+            # Compatibilidad si Pinggy imprime el host sin udp://.
+            if [[ -z "$ENDPOINT" ]]; then
+              ENDPOINT="$(
+                printf '%s\n' "$CLEAN_LOG" |
+                grep -Eo '[[:alnum:]][[:alnum:].-]*:[0-9]{1,5}' |
+                tail -n 1 || true
+              )"
+            fi
 
             if [[ -n "$ENDPOINT" ]]; then
               break
             fi
 
             if ! kill -0 "$PINGGY_PID" 2>/dev/null; then
-              echo "ERROR: Pinggy terminó inesperadamente."
+              echo "ERROR: Pinggy se cerró inesperadamente."
               cat "$DIR/pinggy.log"
               exit 1
             fi
@@ -159,45 +160,61 @@ jobs:
           done
 
           if [[ -z "$ENDPOINT" ]]; then
-            echo "ERROR: Pinggy no proporcionó una dirección UDP."
+            echo "ERROR: Pinggy no entregó dirección pública."
             cat "$DIR/pinggy.log"
             exit 1
           fi
 
-          # Separar dirección y puerto público.
+          # Quitar prefijo y signos de puntuación finales.
           ENDPOINT="${ENDPOINT#udp://}"
+          ENDPOINT="${ENDPOINT%,}"
+          ENDPOINT="${ENDPOINT%;}"
+          ENDPOINT="${ENDPOINT%)}"
+          ENDPOINT="${ENDPOINT%/}"
 
-          PUBLIC_HOST="${ENDPOINT%:*}"
-          PUBLIC_PORT="${ENDPOINT##*:}"
+          echo "Dirección recibida: $ENDPOINT"
 
-          if [[ -z "$PUBLIC_HOST" || ! "$PUBLIC_PORT" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: Dirección UDP no válida: $ENDPOINT"
+          # Extraer el puerto numérico del final.
+          PUBLIC_PORT="$(printf '%s' "$ENDPOINT" |
+            sed -nE 's/.*:([0-9]{1,5})$/\1/p')"
+
+          if [[ -z "$PUBLIC_PORT" ]]; then
+            echo "ERROR: no se pudo extraer el puerto."
+            printf 'Valor exacto: %q\n' "$ENDPOINT"
+            cat "$DIR/pinggy.log"
             exit 1
           fi
 
-          # Crear URI para Agent VPN.
+          PUBLIC_HOST="${ENDPOINT%:$PUBLIC_PORT}"
+
+          if [[ -z "$PUBLIC_HOST" ]]; then
+            echo "ERROR: no se pudo extraer el dominio."
+            exit 1
+          fi
+
+          echo "Dominio detectado: $PUBLIC_HOST"
+          echo "Puerto detectado: $PUBLIC_PORT"
+
           URI="hysteria2://${PASSWORD}@${PUBLIC_HOST}:${PUBLIC_PORT}/?insecure=1#AgentVPN"
 
           echo ""
-          echo "============================================"
-          echo "          HYSTERIA 2 FUNCIONANDO"
-          echo "============================================"
+          echo "=========================================="
+          echo "          HYSTERIA 2 LISTO"
+          echo "=========================================="
           echo ""
           echo "SERVIDOR: $PUBLIC_HOST"
           echo "PUERTO UDP PUBLICO: $PUBLIC_PORT"
           echo "PUERTO LOCAL: $PORT"
           echo "PROTOCOLO: Hysteria 2"
           echo "CONTRASEÑA: $PASSWORD"
-          echo "TLS: insecure=1"
           echo ""
           echo "========== URI PARA AGENT VPN ============"
           echo "$URI"
-          echo "============================================"
+          echo "=========================================="
           echo ""
 
-          echo "Manteniendo el servidor y el túnel activos..."
+          echo "Manteniendo los procesos activos..."
 
-          # Mantener ambos procesos funcionando.
           while true; do
 
             if ! kill -0 "$HY2_PID" 2>/dev/null; then
