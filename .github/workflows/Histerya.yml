@@ -1,5 +1,4 @@
-
-name: Hysteria 2 with Pinggy UDP
+name: Hysteria 2 con Pinggy UDP
 
 on:
   workflow_dispatch:
@@ -10,209 +9,167 @@ permissions:
 jobs:
   hysteria:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 59
 
     steps:
-      - name: Install Node.js
+      - name: Instalar dependencias
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: "22"
 
-      - name: Install Hysteria 2
+      - name: Instalar Hysteria 2 y Pinggy
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          curl -fsSL https://get.hy2.sh/ \
-            -o "$RUNNER_TEMP/install-hy2.sh"
+          sudo apt-get update
+          sudo apt-get install -y curl openssl ca-certificates
 
-          sudo bash "$RUNNER_TEMP/install-hy2.sh"
+          curl -fsSL https://get.hy2.sh/ | bash
+          npm install -g pinggy
 
-          hysteria version
+          command -v hysteria
+          command -v pinggy
 
-      - name: Install Pinggy CLI
-        run: npm install -g pinggy
-
-      - name: Start Hysteria and Pinggy UDP
+      - name: Crear servidor y túnel UDP
         shell: bash
         env:
           PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          if [ -z "${PINGGY_TOKEN:-}" ]; then
-            echo "ERROR: PINGGY_TOKEN secret is missing."
+          if [[ -z "${PINGGY_TOKEN:-}" ]]; then
+            echo "ERROR: falta el secreto PINGGY_TOKEN."
             exit 1
           fi
 
           PORT=8443
-          SNI="hysteria-pinggy"
-          HY2_LOG="$RUNNER_TEMP/hysteria.log"
-          PINGGY_LOG="$RUNNER_TEMP/pinggy.log"
-          CONFIG="$RUNNER_TEMP/config.yaml"
+          DIR="${RUNNER_TEMP}/hysteria-pinggy"
+          mkdir -p "$DIR"
 
-          HY2_PID=""
-          PINGGY_PID=""
-          TAIL_PID=""
-
-          cleanup() {
-            [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
-            [ -n "$PINGGY_PID" ] && kill "$PINGGY_PID" 2>/dev/null || true
-            [ -n "$HY2_PID" ] && kill "$HY2_PID" 2>/dev/null || true
-          }
-
-          trap cleanup EXIT INT TERM
-
-          # Generate TLS certificate
-          openssl req -x509 -newkey rsa:2048 -sha256 \
-            -days 2 -nodes \
-            -keyout "$RUNNER_TEMP/server.key" \
-            -out "$RUNNER_TEMP/server.crt" \
-            -subj "/CN=$SNI" \
-            -addext "subjectAltName=DNS:$SNI"
-
-          chmod 600 "$RUNNER_TEMP/server.key"
-
-          # Generate password
           PASSWORD="$(openssl rand -hex 24)"
 
-          # Calculate certificate fingerprint
-          CERT_PIN="$(openssl x509 \
-            -in "$RUNNER_TEMP/server.crt" \
-            -noout -fingerprint -sha256 \
-            | sed 's/.*=//' \
-            | tr -d ':' \
-            | tr '[:upper:]' '[:lower:]')"
+          # Certificado autofirmado para esta ejecución.
+          openssl req -x509 -newkey rsa:2048 \
+            -sha256 \
+            -nodes \
+            -days 2 \
+            -keyout "$DIR/server.key" \
+            -out "$DIR/server.crt" \
+            -subj "/CN=hy2.local" \
+            -addext "subjectAltName=DNS:hy2.local"
 
-          # Configure Hysteria
-          cat > "$CONFIG" <<EOF
-          listen: ":$PORT"
+          # Configuración del servidor Hysteria 2.
+          cat > "$DIR/config.yaml" <<EOF
+          listen: 0.0.0.0:${PORT}
 
           tls:
-            cert: "$RUNNER_TEMP/server.crt"
-            key: "$RUNNER_TEMP/server.key"
+            cert: ${DIR}/server.crt
+            key: ${DIR}/server.key
+            sniGuard: disable
 
           auth:
             type: password
-            password: "$PASSWORD"
+            password: ${PASSWORD}
           EOF
 
-          chmod 600 "$CONFIG"
+          echo "Iniciando Hysteria 2..."
 
-          # Start Hysteria
-          echo "Starting Hysteria 2..."
+          hysteria server -c "$DIR/config.yaml" \
+            > "$DIR/hysteria.log" 2>&1 &
 
-          hysteria server -c "$CONFIG" > "$HY2_LOG" 2>&1 &
           HY2_PID=$!
 
           sleep 3
 
           if ! kill -0 "$HY2_PID" 2>/dev/null; then
-            echo "ERROR: Hysteria failed to start."
-            cat "$HY2_LOG"
+            echo "ERROR: Hysteria no pudo iniciarse."
+            cat "$DIR/hysteria.log"
             exit 1
           fi
 
-          echo "Hysteria is listening on UDP $PORT."
+          echo "Hysteria está funcionando."
 
-          # Start Pinggy UDP tunnel
-          echo "Starting Pinggy UDP tunnel..."
+          # Crear el túnel UDP de Pinggy.
+          echo "Iniciando túnel UDP de Pinggy..."
 
           pinggy \
             --type udp \
-            --localport "$PORT" \
+            --localport "127.0.0.1:${PORT}" \
             --token "$PINGGY_TOKEN" \
-            --v > "$PINGGY_LOG" 2>&1 &
+            --v \
+            > "$DIR/pinggy.log" 2>&1 &
 
           PINGGY_PID=$!
 
-          # Wait for Pinggy to allocate its public endpoint
-          REMOTE_URL=""
+          # Esperar a que Pinggy proporcione la dirección pública.
+          ENDPOINT=""
 
-          for i in $(seq 1 120); do
+          for attempt in $(seq 1 120); do
+            ENDPOINT="$(grep -Eo 'udp://[^[:space:]]+' "$DIR/pinggy.log" | head -n 1 || true)"
 
-            if ! kill -0 "$HY2_PID" 2>/dev/null; then
-              echo "ERROR: Hysteria stopped unexpectedly."
-              cat "$HY2_LOG"
-              exit 1
+            if [[ -n "$ENDPOINT" ]]; then
+              break
             fi
 
             if ! kill -0 "$PINGGY_PID" 2>/dev/null; then
-              echo "ERROR: Pinggy stopped unexpectedly."
-              cat "$PINGGY_LOG"
+              echo "ERROR: Pinggy se cerró antes de crear el túnel."
+              cat "$DIR/pinggy.log"
               exit 1
-            fi
-
-            REMOTE_URL="$(sed -E \
-              's/\x1B\[[0-9;]*[[:alpha:]]//g' \
-              "$PINGGY_LOG" \
-              | grep -Eo 'udp://[A-Za-z0-9.-]+:[0-9]+' \
-              | tail -n 1 || true)"
-
-            if [ -n "$REMOTE_URL" ]; then
-              break
             fi
 
             sleep 1
           done
 
-          if [ -z "$REMOTE_URL" ]; then
-            echo "ERROR: Could not detect Pinggy public UDP endpoint."
-            cat "$PINGGY_LOG"
+          if [[ -z "$ENDPOINT" ]]; then
+            echo "ERROR: no se recibió la dirección UDP de Pinggy."
+            cat "$DIR/pinggy.log"
             exit 1
           fi
 
-          # Extract public hostname and port
-          ENDPOINT="${REMOTE_URL#udp://}"
+          # Separar hostname y puerto público.
+          ENDPOINT="${ENDPOINT#udp://}"
           PUBLIC_HOST="${ENDPOINT%:*}"
           PUBLIC_PORT="${ENDPOINT##*:}"
 
-          if ! [[ "$PUBLIC_PORT" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: Invalid public UDP port."
+          if [[ -z "$PUBLIC_HOST" || ! "$PUBLIC_PORT" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: dirección UDP recibida no válida: $ENDPOINT"
+            cat "$DIR/pinggy.log"
             exit 1
           fi
 
-          # Construct Hysteria 2 import URI
-          URI="hysteria2://${PASSWORD}@${PUBLIC_HOST}:${PUBLIC_PORT}/?sni=${SNI}&insecure=1&pinSHA256=${CERT_PIN}#Hysteria-Pinggy"
-
-          # Print Pinggy connection information
-          cat "$PINGGY_LOG"
+          # Perfil simplificado para Agent VPN.
+          URI="hysteria2://${PASSWORD}@${PUBLIC_HOST}:${PUBLIC_PORT}/?insecure=1#AgentVPN"
 
           echo ""
-          echo "================================================"
-          echo "          HYSTERIA 2 SERVER READY"
-          echo "================================================"
+          echo "=========================================="
+          echo "       HYSTERIA 2 CONECTADO"
+          echo "=========================================="
           echo ""
-          echo "SERVER ADDRESS: $PUBLIC_HOST"
-          echo "PUBLIC PORT: $PUBLIC_PORT"
-          echo "LOCAL PORT: $PORT"
-          echo "PROTOCOL: UDP / QUIC"
-          echo "USERNAME: Not required"
-          echo "PASSWORD: $PASSWORD"
-          echo "SNI: $SNI"
-          echo "TLS: Enabled"
-          echo "TLS INSECURE: Enabled with certificate pin"
-          echo "CERTIFICATE SHA256: $CERT_PIN"
+          echo "SERVIDOR: $PUBLIC_HOST"
+          echo "PUERTO UDP: $PUBLIC_PORT"
+          echo "PUERTO LOCAL: $PORT"
+          echo "PROTOCOLO: Hysteria 2"
+          echo "CONTRASEÑA: $PASSWORD"
+          echo "TLS: insecure=1"
           echo ""
-          echo "COMPLETE ANDROID IMPORT URI:"
-          echo ""
+          echo "========== URI PARA AGENT VPN =========="
           echo "$URI"
+          echo "========================================"
           echo ""
-          echo "================================================"
-          echo "Keep this GitHub Actions job running."
-          echo "================================================"
 
-          # Continue displaying Pinggy logs
-          tail -n 0 -F "$PINGGY_LOG" &
-          TAIL_PID=$!
+          echo "El servidor y el túnel permanecerán activos."
+          echo "No detengas esta ejecución."
 
-          # Keep both services alive
-          while kill -0 "$HY2_PID" 2>/dev/null &&
-                kill -0 "$PINGGY_PID" 2>/dev/null; do
-            sleep 5
+          # Mantener vivos ambos procesos.
+          while kill -0 "$HY2_PID" 2>/dev/null && kill -0 "$PINGGY_PID" 2>/dev/null; do
+            sleep 10
           done
 
-          echo "ERROR: One of the services stopped."
-          cat "$HY2_LOG"
-          cat "$PINGGY_LOG"
+          echo "ERROR: uno de los procesos se detuvo."
+          echo "----- LOG HYSTERIA -----"
+          cat "$DIR/hysteria.log"
+          echo "----- LOG PINGGY -----"
+          cat "$DIR/pinggy.log"
+
           exit 1
